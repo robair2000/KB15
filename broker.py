@@ -104,7 +104,7 @@ class BaseBroker:
         return df.tail(limit).reset_index(drop=True)
 
     def book(self, sym):
-        ob = self.ex.fetch_order_book(sym, limit=5)
+        ob = self.ex.fetch_order_book(sym, limit=20)
         return float(ob["bids"][0][0]), float(ob["asks"][0][0])
 
 
