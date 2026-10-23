@@ -104,7 +104,7 @@ class BaseBroker:
         return df.tail(limit).reset_index(drop=True)
 
     def book(self, sym):
-        ob = self.ex.fetch_order_book(sym, limit=20)
+        ob = self.ex.fetch_order_book(sym, limit=20)        # KuCoin Futures only accepts 20 or 100
         return float(ob["bids"][0][0]), float(ob["asks"][0][0])
 
 
@@ -154,14 +154,22 @@ class LiveBroker(BaseBroker):
         return o["id"]
 
     def order(self, sym, oid):
-        o = self.ex.fetch_order(oid, sym)
+        """status: open | closed | canceled | missing (KuCoin forgets cancelled orders with no fill)."""
+        try:
+            o = self.ex.fetch_order(oid, sym)
+        except Exception as e:
+            if type(e).__name__ == "OrderNotFound" or "orderNotExist" in str(e):
+                return {"status": "missing", "filled": 0.0}
+            raise
         return {"status": o["status"], "filled": float(o.get("filled") or 0)}
 
     def cancel(self, sym, oid):
         try:
             self.ex.cancel_order(oid, sym)
         except Exception as e:
-            log.info("cancel %s %s: %s", sym, oid, e)
+            # 100004 / orderNotExist = already filled or cancelled; that's normal, not an error
+            quiet = "cannot be canceled" in str(e) or "orderNotExist" in str(e) or type(e).__name__ == "OrderNotFound"
+            log.log(logging.DEBUG if quiet else logging.WARNING, "cancel %s %s: %s", sym, oid, e)
 
     def cancel_stops(self, sym):
         try:
