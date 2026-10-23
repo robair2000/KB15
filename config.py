@@ -129,6 +129,15 @@ VARS = [
     ("WEBHOOK_URL", "", str, "Ops", "Discord/Slack/Telegram-relay webhook for trade alerts"),
     ("HEARTBEAT_BARS", 4, int, "Ops", "post a status webhook every N candles, 0 = off"),
     ("PAPER_START_USDT", 1000.0, float, "Ops", "starting equity in paper mode"),
+
+    # --- Learning (learner.py reads these) ---------------------------------
+    ("LEARN", True, bool, "Learning", "journal every signal + label its outcome (needed for any learning)"),
+    ("LEARNED_FILTER", "shadow", str, "Learning", "off | shadow (log win chance, block nothing) | on (skip signals below LEARNED_MIN_PROB)"),
+    ("LEARNED_MIN_PROB", 0.55, float, "Learning", "with LEARNED_FILTER=on: minimum predicted win chance"),
+    ("RETRAIN_HOURS", 168.0, float, "Learning", "retrain the model this often (168 = weekly)"),
+    ("MIN_TRAIN_SAMPLES", 500, int, "Learning", "labelled signals needed before the first model is trained"),
+    ("TRAIN_DAYS", 60, int, "Learning", "train on the last N days of signals"),
+    ("LEARN_DIR", "", str, "Learning", "where the journal lives; empty = folder of STATE_FILE (the disk)"),
 ]
 
 SECRETS = {"API_KEY", "API_SECRET", "API_PASSWORD", "WEBHOOK_URL"}

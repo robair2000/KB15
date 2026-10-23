@@ -30,6 +30,7 @@ import urllib.request
 import config as C
 from broker import LiveBroker, OrderRejected, PaperBroker, make_exchange
 from filters import OIFeed, context, describe, entry_block, spike_kind, spike_text
+from learner import Learner, make_features
 from fmt import fp
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stdout,
@@ -124,6 +125,8 @@ class Bot:
         self.s = self._load()
         self.paper = isinstance(broker, PaperBroker)
         self.oi = OIFeed() if C.OI_FILTER else None
+        self.learn = Learner("KB15", C.LEARN_DIR or os.path.dirname(os.path.abspath(C.STATE_FILE)), self.tf_s, clock)
+        self._acts, self._feats, self._probs = {}, {}, {}
 
     # ---------------------------------------------------------------- state --
     @staticmethod
@@ -248,6 +251,13 @@ class Bot:
                     log.info("%s: only %d/%d candles, skipped", sym, len(c), C.LOOKBACK)
             except Exception as e:
                 log.warning("candles %s: %s", sym, e)
+        try:
+            n = self.learn.label(candles, lambda c: c["ts"].astype("int64").values,
+                                 fetch=lambda s: self.b.candles(s, C.TIMEFRAME, min(500, int(80 * 3600 / self.tf_s) + 10)))
+            if n:
+                log.info("learner: labelled %d past signal(s)", n)
+        except Exception as e:
+            log.warning("learner labelling failed: %s", e)
         t0 = time.time()
         fcs = self.f.forecast_many(candles, C.TF_MINUTES, C.SAMPLE_PATHS, C.TEMPERATURE, C.TOP_P,
                                    C.HORIZON_BARS, C.TOP_K, C.FORECAST_BATCH) if candles else {}
@@ -297,7 +307,44 @@ class Bot:
             notify(f"♥ equity {self.b.equity():.2f} | open: {held} | today {d['pnl']:+.2f} ({d['trades']}) | "
                    f"total {tt['pnl']:+.2f} ({tt['trades']})")
 
+        self._prepare_journal(fcs, sigs, candles, ctxs)
         self._open_best(bar, fcs, sigs, positions, ctxs)
+        self._write_journal(fcs, sigs, candles)
+        try:
+            self.learn.maybe_retrain()
+        except Exception as e:
+            log.warning("learner training failed: %s", e)
+
+    # ------------------------------------------------------------- journal --
+    def _prepare_journal(self, fcs, sigs, candles, ctxs):
+        self._acts, self._feats, self._probs = {}, {}, {}
+        for s, fc in fcs.items():
+            side = sigs.get(s) or (LONG if fc.exp_return >= 0 else SHORT)
+            ctx = ctxs.get(s)
+            if ctx is None:
+                try:
+                    ctx = context(candles[s], None)
+                except Exception:
+                    ctx = {}
+            t = int(candles[s]["ts"].iloc[-1]) + self.tf_s * 1000
+            self._feats[s] = make_features(side, fc.exp_return, t, ctx, agree=fc.up_share, disp=fc.close_std)
+            self._acts[s] = "signal" if sigs.get(s) else "none"
+
+    def _write_journal(self, fcs, sigs, candles):
+        sl = min(C.STOP_PCT, C.HARD_STOP_PCT) if C.EXCHANGE_STOP else C.STOP_PCT
+        fee = (C.TAKER_FEE if C.ENTRY_MODE == "market" else C.MAKER_FEE) + C.TAKER_FEE
+        rows = []
+        for s, fc in fcs.items():
+            side = sigs.get(s) or 0
+            rows.append(dict(sym=s, t=int(candles[s]["ts"].iloc[-1]) + self.tf_s * 1000, close=fc.last_close,
+                             side=side, er=fc.exp_return, up=fc.up_share,
+                             tp_pct=abs(tp_target(fc) / fc.last_close - 1), sl_pct=sl, hold=C.MAX_HOLD_BARS,
+                             fee=fee, action=self._acts.get(s, "none"), p=self._probs.get(s),
+                             feats=self._feats.get(s, {})))
+        try:
+            self.learn.record(rows)
+        except Exception as e:
+            log.warning("learner journal failed: %s", e)
 
     def _gates(self):
         now, d = self._now(), self.s["day"]
@@ -321,21 +368,40 @@ class Bot:
         sigs = dict(sigs)
         for s, side in list(sigs.items()):
             why = entry_block(side, ctxs.get(s)) if side and s in ctxs else None
+            if side and not why:
+                why, self._probs[s] = self.learn.gate(self._feats.get(s, {}))
+                if self._probs[s] is not None:
+                    log.info("%s %s learned win chance %.0f%%", s.split("/")[0], NAME[side], 100 * self._probs[s])
             if why:
                 log.info("%s %s blocked: %s", s.split("/")[0], NAME[side], why)
+                self._acts[s] = f"blocked: {why}"
                 sigs[s] = None
         untracked = [s for s in positions if s not in trades]
         if untracked:
             log.warning("untracked positions (not touched, count toward MAX_POSITIONS): %s", untracked)
         slots = C.MAX_POSITIONS - len(trades) - len(untracked)
+        for s, side in sigs.items():
+            if not side:
+                continue
+            for cond, what in ((not allowed(side), "side disabled"), (s in trades, "already in a trade"),
+                               (s in positions, "untracked position on coin"),
+                               (bar < self.s["cooldown"].get(s, -1), "cooldown"),
+                               (s not in self.s["universe"], "not in universe")):
+                if cond:
+                    self._acts[s] = f"skip: {what}"
+                    break
         cands = sorted(((score(fcs[s]), s, side) for s, side in sigs.items()
                         if side and allowed(side) and s not in trades and s not in positions
                         and bar >= self.s["cooldown"].get(s, -1) and s in self.s["universe"]), reverse=True)
         if slots <= 0 or not cands:
+            for _, s, _ in cands:
+                self._acts[s] = "skip: no free slot"
             return
         why = self._gates()
         if why:
             log.info("no entries: %s", why)
+            for _, s, _ in cands:
+                self._acts[s] = f"skip: {why}"
             return
         same = {LONG: 0, SHORT: 0}
         notional = 0.0
@@ -344,14 +410,18 @@ class Bot:
             notional += self.b.notional(s, t["contracts"], t.get("entry_price") or t["entry_limit"])
         for sc, sym, side in cands:
             if slots <= 0:
-                break
+                self._acts[sym] = "skip: no free slot"
+                continue
             if C.MAX_SAME_SIDE and same[side] >= C.MAX_SAME_SIDE:
+                self._acts[sym] = "skip: max same side"
                 continue
             try:
                 n_val = self._enter(sym, fcs[sym], side, bar, sc, notional, ctxs.get(sym))
             except Exception as e:
                 log.warning("enter %s failed: %s", sym, e)
+                self._acts[sym] = "error"
                 continue
+            self._acts[sym] = "opened" if n_val else "skip: entry check (spread/fees/size)"
             if n_val:
                 slots -= 1; same[side] += 1; notional += n_val
 
