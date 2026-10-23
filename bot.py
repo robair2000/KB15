@@ -28,11 +28,14 @@ import config as C
 from broker import LiveBroker, OrderRejected, PaperBroker, make_exchange
 from fmt import fp
 
-logging.basicConfig(level=getattr(logging, C.LOG_LEVEL.upper(), logging.INFO), stream=sys.stdout,
+logging.basicConfig(level=logging.WARNING, stream=sys.stdout,
                     format="%(asctime)s %(levelname)s %(name)s | %(message)s")
+for _name in ("bot", "broker", "forecaster"):   # LOG_LEVEL only affects the bot's own logs, never
+    logging.getLogger(_name).setLevel(getattr(logging, C.LOG_LEVEL.upper(), logging.INFO))  # HTTP dumps
 log = logging.getLogger("bot")
 
 ENTERING, HOLDING, EXITING = "entering", "holding", "exiting"
+DEAD = ("canceled", "cancelled", "expired", "rejected", "missing")   # order no longer resting
 LONG, SHORT = 1, -1
 NAME = {LONG: "LONG", SHORT: "SHORT"}
 
@@ -355,7 +358,7 @@ class Bot:
             st = self.b.order(sym, t["entry_oid"])
             if st["status"] == "closed":
                 self._on_entry_filled(sym, t)
-            elif st["status"] in ("canceled", "cancelled", "expired", "rejected"):
+            elif st["status"] in DEAD:
                 if self.b.positions().get(sym):
                     self._on_entry_filled(sym, t)
                 else:
@@ -384,6 +387,9 @@ class Bot:
             adverse = side * (t["entry_price"] - mid) / t["entry_price"]
             if adverse >= C.STOP_PCT:
                 return self._start_exit(sym, t, f"soft stop {C.STOP_PCT:.2%} (mid {fp(mid)})", cooldown=True)
+            if t.get("tp_oid") and self.b.order(sym, t["tp_oid"])["status"] in DEAD:
+                log.info("%s TP order was cancelled by the exchange, re-placing", sym)
+                t["tp_oid"] = None
             if not t.get("tp_oid"):
                 tp = max(t["target"], ask) if side == LONG else min(t["target"], bid)
                 try:
@@ -430,6 +436,8 @@ class Bot:
         else:
             px = min(bid + C.REPEG_TICKS * tick, ask - tick)
         px = self.b.px(sym, px)
+        if t.get("exit_oid") and self.b.order(sym, t["exit_oid"])["status"] in DEAD:
+            t["exit_oid"] = None                       # exchange cancelled it (post-only would cross)
         if t.get("exit_oid"):
             if abs(t.get("exit_px", 0) - px) < tick / 2 and t.get("exit_qty") == qty:
                 return
