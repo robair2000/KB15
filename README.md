@@ -1,8 +1,9 @@
 # Kronos multi-coin limit-order bot — KuCoin Futures, long + short
 
-A Render background worker. Every 15-minute close it forecasts the next candle for a basket of
+A Render background worker. Every 1-hour close (`TIMEFRAME`) it forecasts the next candle for a basket of
 KuCoin USDT perpetuals with [Kronos](https://github.com/shiyu-coder/Kronos), ranks the signals,
-and opens the best ones, long or short, using **limit orders only**. No market orders exist in the code.
+and opens the best ones, long or short. Take-profits are always maker limits; entries and stops
+use limit or market orders as configured (`ENTRY_MODE`, `STOP_ORDER_TYPE`).
 
 ## How it picks coins
 
@@ -15,22 +16,59 @@ and opens the best ones, long or short, using **limit orders only**. No market o
 * Signals are ranked by `RANK_BY` (`sharpe` = edge ÷ path disagreement, `edge`, or `agreement`) and
   the top ones are opened up to `MAX_POSITIONS`, `MAX_SAME_SIDE` and `MAX_TOTAL_NOTIONAL_USDT`.
 
+## Entry filters (`filters.py`)
+
+Kronos only sees OHLCV. These rules can veto a **new** entry; they never close a trade, and an
+exit on a model flip still happens. Every blocked signal is logged, e.g. `LINK LONG blocked: RSI 78 > 75`.
+
+| Rule | Switch | Blocks |
+|------|--------|--------|
+| RSI | `RSI_FILTER` | longs above `RSI_LONG_MAX`, shorts below `RSI_SHORT_MIN` |
+| Trend | `EMA_FILTER` | longs below the `EMA_PERIOD` EMA, shorts above it |
+| Bollinger | `BB_FILTER` (off by default) | longs closing above the upper band, shorts below the lower |
+| OI spike | `OI_SPIKE_MODE` = `avoid` | any entry for `OI_SPIKE_BARS` candles after a sudden OI jump or drop |
+| | `OI_SPIKE_MODE` = `follow` | entries against the price direction of the spike candle |
+| OI positioning | `OI_FILTER`, `OI_MIN_CHANGE` | longs while price fell and OI rose over `OI_LOOKBACK_BARS` (shorts building), shorts while price rose and OI rose (longs building) |
+
+**OI spikes** are judged per coin: a candle's OI change is a spike when it is `OI_SPIKE_Z` standard
+deviations away from that coin's last `OI_SPIKE_WINDOW` candles and at least `OI_SPIKE_MIN_PCT`.
+A 2% hourly OI drop is a big event for BTC but routine for a small altcoin; a fixed threshold
+would miss the first or fire constantly on the second. Every spike in the universe is posted to the
+webhook (`OI_SPIKE_ALERT`) with a plain reading: OI up + price up = longs piling in, OI up + price
+down = shorts piling in, OI down + price down = longs liquidated, OI down + price up = shorts squeezed.
+
+KuCoin Futures publishes no open-interest history, so OI is read from `OI_EXCHANGE`
+(`binanceusdm` by default, or `bybit`), public data, no keys. Coins listed there as 1000x
+(`1000PEPE`) are matched automatically. If a coin has no OI there, the OI rules are skipped for it
+(or the coin is skipped with `OI_REQUIRED=true`). OI is sampled every `OI_PERIOD` and only readings
+from before each candle close are used, so the backtest has no look-ahead.
+
+Changing `TIMEFRAME` on a running bot is handled (bar counters in `state.json` are rescaled and
+cooldowns cleared), but it is cleanest to switch while flat.
+
 ## How each trade runs
 
-1. **Entry**: post-only limit below the market (long) or above it (short), `ENTRY_PULLBACK` of the way
-   to the forecast low/high. Cancelled after `ENTRY_TTL_BARS` if unfilled.
-2. **Take-profit**: reduce-only post-only limit at `TP_CAPTURE` of the forecast move.
-   Trades that can't clear 2× `MAKER_FEE` + `MIN_NET_EDGE` are skipped.
-3. **Exchange stop-limit** (`EXCHANGE_STOP`): reduce-only stop-*limit* resting on KuCoin at
-   `HARD_STOP_PCT`, so a position is protected even if the bot is down.
-4. **Early exit** at the touch with a re-pegged reduce-only limit, when:
-   - price moves `STOP_PCT` against the entry (soft stop)
-   - the trade has been held `MAX_HOLD_BARS` candles
-   - the model flips to the opposite signal (`EXIT_ON_FLIP`)
+1. **Entry** (`ENTRY_MODE`):
+   - `limit`: post-only limit `ENTRY_PULLBACK` of the way to the forecast low (long) / high (short).
+     Cheapest (maker fee), but often misses the trades where price runs straight away.
+   - `market`: buys/sells at once at the touch. Always fills, pays the taker fee and the spread.
+   - `limit_then_market` (default): the pullback limit first; if it hasn't filled after
+     `ENTRY_CHASE_SECONDS`, the rest is taken at market, **unless** price has run so far that the
+     take-profit no longer clears the taker fee, in which case the trade is dropped.
+   Every entry must leave the take-profit clear of the round-trip fees + `MIN_NET_EDGE`
+   (maker + maker for limit entries, taker + maker for market ones).
+2. **Take-profit**: reduce-only post-only limit at `TP_CAPTURE` of the forecast move (maker).
+3. **Exchange stop** (`EXCHANGE_STOP`): reduce-only stop resting on KuCoin at `HARD_STOP_PCT`, so the
+   position is protected even if the bot is down. A stop-**market** with `STOP_ORDER_TYPE=market`
+   (default), a stop-limit with `STOP_ORDER_TYPE=limit`.
+4. **Soft stop** at `STOP_PCT`: closed at market right away (`STOP_ORDER_TYPE=market`), or with a
+   limit at the touch (`limit`).
+5. **Max hold / model flip** (`MAX_HOLD_BARS`, `EXIT_ON_FLIP`): a limit at the touch first; if it
+   hasn't filled after `EXIT_CHASE_SECONDS`, the rest is closed at market.
 
-> ⚠️ Limit-only means stops are not guaranteed: in a fast move the exit can fill late or far beyond
-> `STOP_PCT`, and the exchange stop-limit can be skipped over entirely if price gaps past its limit.
-> With leverage, keep `HARD_STOP_PCT` well inside your liquidation distance.
+> ⚠️ A market stop always fills but can slip in a fast move. A stop-limit can be skipped over
+> entirely if price gaps past its limit, leaving you in the trade. With leverage, keep
+> `HARD_STOP_PCT` well inside your liquidation distance either way.
 
 ## Tiny-priced coins (PEPE, SHIB, …)
 
@@ -93,6 +131,15 @@ python backtest.py --bars 400 --symbols BTC/USDT:USDT,PEPE/USDT:USDT
 It replays the same ranking, slots and limit-order rules with a conservative fill model, then
 prints per-coin forecast hit-rate and correlation, plus P&L by side, exit reason and coin. Coins
 where the correlation is about zero have no edge: blacklist them.
+
+Kronos runs once per bar and the same forecasts are then traded in **every entry mode** (`limit`,
+`market`, `limit_then_market`), **with and without the filters**: six results side by side, with
+taker fees and `--spread` slippage on every market fill. Narrow it with `--entry` and `--filters`.
+`limit_then_market` uses 5-minute candles to judge whether the limit would have filled before the chase. It also shows, per rule, how the
+signals it blocked moved on the next candle: a rule earns its place only if its blocked signals
+did worse than the ones that passed. Turn off any rule that doesn't. Binance keeps 30 days of OI
+history and the spike detector needs `OI_SPIKE_WINDOW` candles of it first, so on 1h keep `--bars`
+under about 550.
 
 Not financial advice. Kronos is a research model and leveraged futures can lose more than the
 trade size. Run paper mode first and start small.

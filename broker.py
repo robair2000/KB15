@@ -1,8 +1,9 @@
 """Order execution on USDT-margined perpetuals (KuCoin Futures via ccxt), many symbols at once.
 
-Every order this module can send is a LIMIT order:
-  limit()       post-only limit (entries, take-profits, exits)
-  stop_limit()  reduce-only stop-LIMIT resting on the exchange (crash safety net)
+  limit()        post-only limit (maker): entries, take-profits, exits at the touch
+  market()       market order (taker): market / chased entries, stops, chased exits
+  stop_market()  reduce-only stop-MARKET resting on the exchange (crash safety net, always fills)
+  stop_limit()   reduce-only stop-LIMIT resting on the exchange (STOP_ORDER_TYPE=limit)
 Sizes are whole contracts. 1 contract = market contractSize of the coin
 (e.g. 0.001 BTC, or 1,000,000 PEPE), so tiny-priced coins work the same as BTC.
 """
@@ -145,6 +146,21 @@ class LiveBroker(BaseBroker):
                  fp(self.px(sym, price)), o["id"])
         return o["id"]
 
+    def market(self, sym, side, contracts, reduce_only=False):
+        params = self._params()
+        if reduce_only:
+            params["reduceOnly"] = True
+        o = self.ex.create_order(sym, "market", side, int(contracts), None, params)
+        log.info("%s MARKET %s%s %d (%s)", sym, side, " RO" if reduce_only else "", contracts, o["id"])
+        return o["id"]
+
+    def stop_market(self, sym, side, contracts, trigger):
+        o = self.ex.create_order(sym, "market", side, int(contracts), None,
+                                 self._params(stopLossPrice=self.px(sym, trigger), reduceOnly=True,
+                                              triggerPriceType=C.TRIGGER_PRICE_TYPE))
+        log.info("%s exchange stop-market %s %d trig %s (%s)", sym, side, contracts, fp(trigger), o["id"])
+        return o["id"]
+
     def stop_limit(self, sym, side, contracts, trigger, price):
         o = self.ex.create_order(sym, "limit", side, int(contracts), self.px(sym, price),
                                  self._params(stopLossPrice=self.px(sym, trigger), reduceOnly=True,
@@ -217,8 +233,8 @@ class LiveBroker(BaseBroker):
 
 class PaperBroker(BaseBroker):
     """Futures simulator on live public prices. Resting limits fill when the opposite touch
-    trades through them; stop-limits trigger on mid price and then fill as normal limits."""
-    TAKER_FEE = 0.0006
+    trades through them; market orders fill at once at the touch (taker fee); stops trigger on mid
+    price, then a stop-market fills at the touch and a stop-limit rests as a normal limit."""
 
     def __init__(self, exchange, start_equity, maker_fee):
         super().__init__(exchange)
@@ -243,6 +259,24 @@ class PaperBroker(BaseBroker):
         oid = self._new(sym, side=side, amount=int(contracts), price=price, ro=reduce_only, trig=None)
         log.info("[paper] %s %s%s %d @ %s", sym, side, " RO" if reduce_only else "", contracts, fp(price))
         return oid
+
+    def market(self, sym, side, contracts, reduce_only=False):
+        bid, ask = self.book(sym)
+        oid = self._new(sym, side=side, amount=int(contracts), price=ask if side == "buy" else bid,
+                        ro=reduce_only, trig=None)
+        o = self.orders[oid]
+        qty = o["amount"]
+        if reduce_only:
+            pos = self.pos.get(sym, 0)
+            qty = min(qty, abs(pos) if pos and (pos > 0) != (side == "buy") else 0)
+        if qty > 0:
+            self._fill(o, qty, C.TAKER_FEE)
+        o["status"] = "closed" if qty > 0 else "canceled"
+        log.info("[paper] %s MARKET %s%s %d @ %s", sym, side, " RO" if reduce_only else "", qty, fp(o["price"]))
+        return oid
+
+    def stop_market(self, sym, side, contracts, trigger):
+        return self._new(sym, side=side, amount=int(contracts), price=None, ro=True, trig=self.px(sym, trigger))
 
     def stop_limit(self, sym, side, contracts, trigger, price):
         return self._new(sym, side=side, amount=int(contracts), price=self.px(sym, price), ro=True,
@@ -284,7 +318,9 @@ class PaperBroker(BaseBroker):
                         o["triggered"] = True
                     else:
                         continue
-                fee = self.TAKER_FEE
+                fee = C.TAKER_FEE
+                if o["price"] is None:                      # stop-market: fill at the touch
+                    o["price"] = ask if buy else bid
             if not ((buy and ask <= o["price"]) or (not buy and bid >= o["price"])):
                 continue
             qty = o["amount"] - o["filled"]

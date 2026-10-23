@@ -31,7 +31,7 @@ services:
       - key: KUCOIN_UTA
         value: "auto"
       - key: TIMEFRAME
-        value: "15m"
+        value: "1h"
       - key: SYMBOLS
         value: ""
       - key: UNIVERSE_SIZE
@@ -45,7 +45,7 @@ services:
       - key: ALWAYS_INCLUDE
         value: ""
       - key: UNIVERSE_REFRESH_BARS
-        value: "16"
+        value: "4"
       - key: RANK_BY
         value: "sharpe"
       - key: MAX_POSITIONS
@@ -91,9 +91,9 @@ services:
       - key: TORCH_THREADS
         value: "0"
       - key: MIN_EDGE_LONG
-        value: "0.0015"
+        value: "0.003"
       - key: MIN_EDGE_SHORT
-        value: "0.0015"
+        value: "0.003"
       - key: MIN_AGREEMENT
         value: "0.7"
       - key: MAX_DISPERSION
@@ -104,11 +104,63 @@ services:
         value: "0.8"
       - key: MAKER_FEE
         value: "0.0002"
+      - key: TAKER_FEE
+        value: "0.0006"
       - key: MIN_NET_EDGE
-        value: "0.0005"
+        value: "0.001"
       - key: EXIT_ON_FLIP
         value: "true"
       - key: REVERSE_ON_FLIP
+        value: "false"
+      - key: ENTRY_MODE
+        value: "limit_then_market"
+      - key: ENTRY_CHASE_SECONDS
+        value: "120"
+      - key: STOP_ORDER_TYPE
+        value: "market"
+      - key: EXIT_CHASE_SECONDS
+        value: "120"
+      - key: RSI_FILTER
+        value: "true"
+      - key: RSI_PERIOD
+        value: "14"
+      - key: RSI_LONG_MAX
+        value: "75.0"
+      - key: RSI_SHORT_MIN
+        value: "25.0"
+      - key: EMA_FILTER
+        value: "true"
+      - key: EMA_PERIOD
+        value: "50"
+      - key: BB_FILTER
+        value: "false"
+      - key: BB_PERIOD
+        value: "20"
+      - key: BB_STD
+        value: "2.0"
+      - key: OI_FILTER
+        value: "true"
+      - key: OI_EXCHANGE
+        value: "binanceusdm"
+      - key: OI_PERIOD
+        value: "5m"
+      - key: OI_LOOKBACK_BARS
+        value: "4"
+      - key: OI_MIN_CHANGE
+        value: "0.01"
+      - key: OI_SPIKE_MODE
+        value: "avoid"
+      - key: OI_SPIKE_Z
+        value: "3.0"
+      - key: OI_SPIKE_MIN_PCT
+        value: "0.005"
+      - key: OI_SPIKE_WINDOW
+        value: "100"
+      - key: OI_SPIKE_BARS
+        value: "2"
+      - key: OI_SPIKE_ALERT
+        value: "true"
+      - key: OI_REQUIRED
         value: "false"
       - key: SIZE_MODE
         value: "fixed"
@@ -121,13 +173,13 @@ services:
       - key: MAX_NOTIONAL_USDT
         value: "0.0"
       - key: STOP_PCT
-        value: "0.008"
+        value: "0.015"
       - key: EXCHANGE_STOP
         value: "true"
       - key: HARD_STOP_PCT
-        value: "0.015"
+        value: "0.03"
       - key: STOP_LIMIT_SLIPPAGE
-        value: "0.003"
+        value: "0.005"
       - key: MAX_HOLD_BARS
         value: "3"
       - key: ENTRY_TTL_BARS
@@ -161,6 +213,6 @@ services:
       - key: WEBHOOK_URL            # Discord/Slack/Telegram-relay webhook for trade alerts
         sync: false
       - key: HEARTBEAT_BARS
-        value: "16"
+        value: "4"
       - key: PAPER_START_USDT
         value: "1000.0"

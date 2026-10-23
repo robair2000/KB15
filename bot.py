@@ -1,19 +1,22 @@
-"""Kronos multi-coin scanner -> limit-order-only long/short bot for KuCoin Futures.
+"""Kronos multi-coin scanner -> long/short bot for KuCoin Futures.
 
-Every candle close:
+Every candle close (TIMEFRAME, 1h by default):
   1. (re)build the universe: SYMBOLS, or the most liquid USDT perpetuals with tight spreads
   2. forecast every coin in the universe plus every coin we hold, in batches
   3. manage open trades (exit on model flip / max hold)
-  4. rank fresh signals (RANK_BY) and open the best ones up to MAX_POSITIONS
+  4. drop signals vetoed by the RSI / EMA / Bollinger / open-interest filters (filters.py)
+  5. rank the rest (RANK_BY) and open the best ones up to MAX_POSITIONS
 
 Per-coin trade lifecycle (side = long or short)
-  flat ──signal──▶ entering   post-only limit, below market (long) / above market (short)
-  entering ──fill──▶ holding  reduce-only post-only take-profit + exchange stop-LIMIT safety net
+  flat ──signal──▶ entering   ENTRY_MODE: post-only limit on a pullback | market |
+                              limit, then market after ENTRY_CHASE_SECONDS if still worth it
+  entering ──fill──▶ holding  reduce-only post-only take-profit + exchange stop (STOP_ORDER_TYPE)
   entering ──TTL──▶ flat
   holding ──TP / exchange stop / manual close (position = 0)──▶ flat
-  holding ──soft stop / max hold / model flips──▶ exiting  reduce-only limit re-pegged at the touch
+  holding ──soft stop──▶ exiting  market close (STOP_ORDER_TYPE=market) or limit at the touch
+  holding ──max hold / model flips──▶ exiting  limit re-pegged at the touch, market after EXIT_CHASE_SECONDS
   exiting ──position = 0──▶ flat
-The exchange position is the source of truth. No market orders are ever sent.
+The exchange position is the source of truth. Take-profits are always maker limits.
 """
 import datetime as dt
 import json
@@ -26,11 +29,12 @@ import urllib.request
 
 import config as C
 from broker import LiveBroker, OrderRejected, PaperBroker, make_exchange
+from filters import OIFeed, context, describe, entry_block, spike_kind, spike_text
 from fmt import fp
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stdout,
                     format="%(asctime)s %(levelname)s %(name)s | %(message)s")
-for _name in ("bot", "broker", "forecaster"):   # LOG_LEVEL only affects the bot's own logs, never
+for _name in ("bot", "broker", "forecaster", "filters"):   # LOG_LEVEL only affects the bot's own logs, never
     logging.getLogger(_name).setLevel(getattr(logging, C.LOG_LEVEL.upper(), logging.INFO))  # HTTP dumps
 log = logging.getLogger("bot")
 
@@ -78,22 +82,31 @@ def score(fc):
     return edge / max(fc.close_std, edge * 0.05, 1e-9)            # sharpe-like
 
 
-def plan_entry(fc, side, bid, ask, tick):
-    """(entry, target) for a maker entry, or (None, None) if the TP can't clear fees."""
-    last = fc.last_close
-    target = last + C.TP_CAPTURE * (fc.close - last)
-    cost = 2 * C.MAKER_FEE + C.MIN_NET_EDGE
-    if side == LONG:
+def tp_target(fc):
+    return fc.last_close + C.TP_CAPTURE * (fc.close - fc.last_close)
+
+
+def worth_it(side, entry, target, market):
+    """Does the maker take-profit clear the round-trip fees + MIN_NET_EDGE from this entry?"""
+    cost = (C.TAKER_FEE if market else C.MAKER_FEE) + C.MAKER_FEE + C.MIN_NET_EDGE
+    return target >= entry * (1 + cost) if side == LONG else target <= entry * (1 - cost)
+
+
+def plan_entry(fc, side, bid, ask, tick, market=False):
+    """(entry, target), or (None, None) if the TP can't clear fees.
+    Limit: pullback price (maker). Market: the touch we would take (taker)."""
+    last, target = fc.last_close, tp_target(fc)
+    if market:
+        entry = ask if side == LONG else bid
+    elif side == LONG:
         entry = min(last - C.ENTRY_PULLBACK * max(last - fc.low, 0), bid, ask - tick)
-        ok = target >= entry * (1 + cost)
     else:
         entry = max(last + C.ENTRY_PULLBACK * max(fc.high - last, 0), ask, bid + tick)
-        ok = target <= entry * (1 - cost)
-    return (entry, target) if ok else (None, None)
+    return (entry, target) if worth_it(side, entry, target, market) else (None, None)
 
 
 def stop_prices(side, entry):
-    """Exchange stop-limit (trigger, limit) for a position."""
+    """Exchange stop (trigger, limit) for a position; the limit is unused for a stop-market."""
     trig = entry * (1 - side * C.HARD_STOP_PCT)
     return trig, trig * (1 - side * C.STOP_LIMIT_SLIPPAGE)
 
@@ -110,11 +123,12 @@ class Bot:
         self.tf_s = C.TF_MINUTES * 60
         self.s = self._load()
         self.paper = isinstance(broker, PaperBroker)
+        self.oi = OIFeed() if C.OI_FILTER else None
 
     # ---------------------------------------------------------------- state --
     @staticmethod
     def _blank():
-        return {"last_bar": None, "universe": [], "universe_bar": -10**9, "trades": {}, "cooldown": {},
+        return {"tf": C.TIMEFRAME, "last_bar": None, "universe": [], "universe_bar": -10**9, "trades": {}, "cooldown": {},
                 "day": {"date": "", "trades": 0, "pnl": 0.0, "losses_in_row": 0},
                 "total": {"trades": 0, "wins": 0, "pnl": 0.0}}
 
@@ -125,11 +139,29 @@ class Bot:
                     s = json.load(fh)
                 if "trades" in s:
                     log.info("resumed %d trade(s): %s", len(s["trades"]), list(s["trades"]))
-                    return s
+                    return self._migrate_tf(s)
                 log.warning("state file is from the single-coin version; starting fresh")
             except Exception as e:
                 log.warning("bad state file (%s), starting fresh", e)
         return self._blank()
+
+    def _migrate_tf(self, s):
+        """Bar numbers are epoch // candle length, so they change meaning with TIMEFRAME.
+        Without this, a 15m state read by a 1h bot would block coins in cooldown for years."""
+        if s.get("tf") == C.TIMEFRAME:
+            return s
+        new_s = C.TF_MINUTES * 60
+        old_s = new_s
+        if s.get("last_bar"):                      # infer the old candle length from the last bar seen
+            old_s = round(self.clock() / (s["last_bar"] + 1) / 60) * 60 or new_s
+        log.warning("state was written for %s candles, now %s: rescaling bar counters",
+                    s.get("tf") or f"{old_s // 60}m", C.TIMEFRAME)
+        for t in s["trades"].values():
+            if t.get("entry_bar") is not None:
+                t["entry_bar"] = t["entry_bar"] * old_s // new_s
+        s["cooldown"] = {}
+        s["last_bar"], s["universe_bar"], s["tf"] = None, -10**9, C.TIMEFRAME
+        return s
 
     def save(self):
         tmp = C.STATE_FILE + ".tmp"
@@ -162,7 +194,9 @@ class Bot:
     def run(self):
         notify(f"Kronos bot up | {C.MODE} | {C.EXCHANGE} {C.TIMEFRAME} x{C.LEVERAGE} {C.MARGIN_MODE} | "
                f"{'SYMBOLS=' + ','.join(C.SYMBOL_LIST) if C.SYMBOL_LIST else f'auto top {C.UNIVERSE_SIZE}'} | "
-               f"max {C.MAX_POSITIONS} positions | long={C.ALLOW_LONG} short={C.ALLOW_SHORT}")
+               f"max {C.MAX_POSITIONS} positions | long={C.ALLOW_LONG} short={C.ALLOW_SHORT} | filters: "
+               + (", ".join(n for n, on in (("RSI", C.RSI_FILTER), ("EMA", C.EMA_FILTER), ("BB", C.BB_FILTER),
+                                            (f"OI via {C.OI_EXCHANGE}", C.OI_FILTER)) if on) or "none"))
         stop = {"flag": False}
         signal.signal(signal.SIGTERM, lambda *_: stop.update(flag=True))
         while not stop["flag"]:
@@ -223,6 +257,22 @@ class Bot:
         for s, fc in fcs.items():
             log.debug("%s %s", s, fc)
 
+        ctxs = {}                       # filter readings; every coin when watching OI spikes
+        watch = C.OI_FILTER and (C.OI_SPIKE_ALERT or C.OI_SPIKE_MODE.lower() != "off")
+        for s, side in sigs.items():
+            if not (watch or (side and allowed(side) and s not in trades)):
+                continue
+            oi = self.oi.recent(s) if self.oi else None
+            try:
+                ctxs[s] = context(candles[s], oi)
+            except Exception as e:
+                log.warning("filters %s: %s", s, e)
+                continue
+            sp = ctxs[s].get("oi_spike")
+            if sp and sp["ago"] == 0:
+                msg = f"⚡ {s.split(':')[0]} OI spike {spike_text(sp)}: {spike_kind(sp)}"
+                notify(msg) if C.OI_SPIKE_ALERT else log.info(msg)
+
         positions = self.b.positions()
         for sym, t in list(trades.items()):
             if t["phase"] == ENTERING and bar - t["entry_bar"] >= C.ENTRY_TTL_BARS:
@@ -247,7 +297,7 @@ class Bot:
             notify(f"♥ equity {self.b.equity():.2f} | open: {held} | today {d['pnl']:+.2f} ({d['trades']}) | "
                    f"total {tt['pnl']:+.2f} ({tt['trades']})")
 
-        self._open_best(bar, fcs, sigs, positions)
+        self._open_best(bar, fcs, sigs, positions, ctxs)
 
     def _gates(self):
         now, d = self._now(), self.s["day"]
@@ -265,8 +315,15 @@ class Bot:
             return "equity below MIN_EQUITY_USDT"
         return None
 
-    def _open_best(self, bar, fcs, sigs, positions):
+    def _open_best(self, bar, fcs, sigs, positions, ctxs=None):
         trades = self.s["trades"]
+        ctxs = ctxs or {}
+        sigs = dict(sigs)
+        for s, side in list(sigs.items()):
+            why = entry_block(side, ctxs.get(s)) if side and s in ctxs else None
+            if why:
+                log.info("%s %s blocked: %s", s.split("/")[0], NAME[side], why)
+                sigs[s] = None
         untracked = [s for s in positions if s not in trades]
         if untracked:
             log.warning("untracked positions (not touched, count toward MAX_POSITIONS): %s", untracked)
@@ -291,7 +348,7 @@ class Bot:
             if C.MAX_SAME_SIDE and same[side] >= C.MAX_SAME_SIDE:
                 continue
             try:
-                n_val = self._enter(sym, fcs[sym], side, bar, sc, notional)
+                n_val = self._enter(sym, fcs[sym], side, bar, sc, notional, ctxs.get(sym))
             except Exception as e:
                 log.warning("enter %s failed: %s", sym, e)
                 continue
@@ -311,15 +368,17 @@ class Bot:
         n = self.b.contracts_for(sym, max(notional, 0), price)
         return min(n, C.MAX_CONTRACTS) if C.MAX_CONTRACTS else n
 
-    def _enter(self, sym, fc, side, bar, sc, open_notional):
+    def _enter(self, sym, fc, side, bar, sc, open_notional, ctx=None):
         """Place an entry. Returns its notional, or 0 if skipped."""
         if not self.spread_ok(sym):
             log.info("%s spread too wide right now, skip", sym)
             return 0
         bid, ask = self.b.book(sym)
-        entry, target = plan_entry(fc, side, bid, ask, self.b.tick(sym))
+        mkt = C.ENTRY_MODE == "market"
+        entry, target = plan_entry(fc, side, bid, ask, self.b.tick(sym), market=mkt)
         if entry is None:
-            log.info("%s %s signal but TP too close after fees, skip", sym, NAME[side])
+            log.info("%s %s signal but TP too close after %s fees, skip", sym, NAME[side],
+                     "taker" if mkt else "maker")
             return 0
         n = self._size(sym, entry, open_notional)
         if n < self.b.meta(sym)["min"]:
@@ -327,18 +386,23 @@ class Bot:
                      fp(self.b.meta(sym)["cs"]), self.b.meta(sym)["base"])
             return 0
         self.b.setup(sym)
+        buy = "buy" if side == LONG else "sell"
+        realized0 = self.b.realized_total(sym) if self.paper else None   # before a market fill lands
         try:
-            oid = self.b.limit(sym, "buy" if side == LONG else "sell", n, entry)
+            oid = self.b.market(sym, buy, n) if mkt else self.b.limit(sym, buy, n, entry)
         except OrderRejected as e:
             log.info("%s entry rejected (post-only): %s", sym, e)
             return 0
+        chase = C.ENTRY_MODE == "limit_then_market" and C.ENTRY_CHASE_SECONDS > 0
         self.s["trades"][sym] = dict(
             phase=ENTERING, side=side, entry_oid=oid, entry_bar=bar, contracts=n,
             entry_limit=self.b.px(sym, entry), target=self.b.px(sym, target),
-            opened_ms=int(self.clock() * 1000),
-            realized0=self.b.realized_total(sym) if self.paper else None)
-        notify(f"{sym} {NAME[side]} limit {n} ct @ {fp(entry)} | TP {fp(target)} | x{C.LEVERAGE} | "
-               f"fc {fc.exp_return:+.3%}, {fc.up_share:.0%} up, score {sc:.2f}")
+            entry_market=mkt, chase_at=self.clock() + C.ENTRY_CHASE_SECONDS if chase else None,
+            opened_ms=int(self.clock() * 1000), realized0=realized0)
+        how = "MARKET" if mkt else "limit" + (f" (market after {C.ENTRY_CHASE_SECONDS}s)" if chase else "")
+        notify(f"{sym} {NAME[side]} {how} {n} ct @ {fp(entry)} | TP {fp(target)} | x{C.LEVERAGE} | "
+               f"fc {fc.exp_return:+.3%}, {fc.up_share:.0%} up, score {sc:.2f}"
+               + (f" | {describe(ctx)}" if ctx else ""))
         return self.b.notional(sym, n, entry)
 
     # ------------------------------------------------------- every poll --
@@ -364,6 +428,8 @@ class Bot:
                 else:
                     log.info("%s entry order %s", sym, st["status"])
                     del self.s["trades"][sym]
+            elif t.get("chase_at") and self.clock() >= t["chase_at"]:
+                self._chase_entry(sym, t)
             return
 
         side = t["side"]
@@ -380,13 +446,14 @@ class Bot:
         mid = (bid + ask) / 2
         t["last_mid"] = mid
 
-        if C.EXCHANGE_STOP and t.get("stop_qty") != qty:
+        if C.EXCHANGE_STOP and t.get("stop_qty") != qty and not t.get("exit_mkt_oid"):
             self._place_exchange_stop(sym, t, qty)
 
         if t["phase"] == HOLDING:
             adverse = side * (t["entry_price"] - mid) / t["entry_price"]
             if adverse >= C.STOP_PCT:
-                return self._start_exit(sym, t, f"soft stop {C.STOP_PCT:.2%} (mid {fp(mid)})", cooldown=True)
+                return self._start_exit(sym, t, f"soft stop {C.STOP_PCT:.2%} (mid {fp(mid)})", cooldown=True,
+                                        urgent=True)
             if t.get("tp_oid") and self.b.order(sym, t["tp_oid"])["status"] in DEAD:
                 log.info("%s TP order was cancelled by the exchange, re-placing", sym)
                 t["tp_oid"] = None
@@ -396,37 +463,97 @@ class Bot:
                     t["tp_oid"] = self.b.limit(sym, "sell" if side == LONG else "buy", qty, tp, reduce_only=True)
                 except OrderRejected as e:
                     log.info("%s TP rejected, retry next poll: %s", sym, e)
+        elif t.get("exit_mkt_oid"):                     # market close sent: resend only if it died
+            st = self.b.order(sym, t["exit_mkt_oid"])
+            if (st["status"] in DEAD or st["status"] == "closed") and self.b.positions().get(sym):
+                log.info("%s market exit %s with %d ct left, sending again", sym, st["status"], qty)
+                self._market_exit(sym, t, qty)
+        elif C.EXIT_CHASE_SECONDS and self.clock() - t.get("exit_started", self.clock()) >= C.EXIT_CHASE_SECONDS:
+            log.info("%s limit exit unfilled after %ds, closing at market", sym, C.EXIT_CHASE_SECONDS)
+            self._market_exit(sym, t, qty)
         else:
             self._repeg(sym, t, qty, bid, ask)
 
+    def _chase_entry(self, sym, t):
+        """limit_then_market: the limit didn't fill in time. Take the market for the rest,
+        unless price has run so far that the take-profit no longer clears taker fees."""
+        t["chase_at"] = None
+        self.b.cancel(sym, t["entry_oid"])
+        side = t["side"]
+        pos, _ = self.b.positions().get(sym, (0, 0.0))
+        rest = t["contracts"] - abs(pos)
+        if rest <= 0:
+            return self._on_entry_filled(sym, t)
+        bid, ask = self.b.book(sym)
+        px = ask if side == LONG else bid
+        if not self.spread_ok(sym) or not worth_it(side, px, t["target"], market=True):
+            log.info("%s limit unfilled; market %s too close to TP %s after taker fee, not chasing",
+                     sym, fp(px), fp(t["target"]))
+            if pos:
+                return self._on_entry_filled(sym, t)
+            del self.s["trades"][sym]
+            return
+        try:
+            t["entry_oid"] = self.b.market(sym, "buy" if side == LONG else "sell", rest)
+        except Exception as e:
+            log.warning("%s market chase failed: %s", sym, e)
+            if pos:
+                return self._on_entry_filled(sym, t)
+            del self.s["trades"][sym]
+            return
+        t["entry_market"] = True
+        notify(f"{sym} {NAME[side]} limit unfilled after {C.ENTRY_CHASE_SECONDS}s -> MARKET {rest} ct near {fp(px)}")
+
     def _on_entry_filled(self, sym, t):
         pos, entry = self.b.positions().get(sym, (0, 0.0))
-        t.update(phase=HOLDING, bars_held=0, entry_price=entry, max_qty=abs(pos),
-                 tp_oid=None, exit_oid=None, stop_oid=None, stop_qty=None)
+        t.update(phase=HOLDING, bars_held=0, entry_price=entry, max_qty=abs(pos), chase_at=None,
+                 tp_oid=None, exit_oid=None, exit_mkt_oid=None, stop_oid=None, stop_qty=None)
         notify(f"{sym} {NAME[t['side']]} FILLED {abs(pos)} ct @ {fp(entry)}")
 
     def _place_exchange_stop(self, sym, t, qty):
         if t.get("stop_oid"):
             self.b.cancel(sym, t["stop_oid"])
         trig, lim = stop_prices(t["side"], t["entry_price"])
+        close = "sell" if t["side"] == LONG else "buy"
         try:
-            t["stop_oid"] = self.b.stop_limit(sym, "sell" if t["side"] == LONG else "buy", qty, trig, lim)
+            if C.STOP_ORDER_TYPE == "market":
+                t["stop_oid"] = self.b.stop_market(sym, close, qty, trig)
+            else:
+                t["stop_oid"] = self.b.stop_limit(sym, close, qty, trig, lim)
             t["stop_qty"] = qty
         except Exception as e:
             log.error("%s could not place exchange stop: %s", sym, e)
             t["stop_oid"], t["stop_qty"] = None, None
 
-    def _start_exit(self, sym, t, why, cooldown=False):
+    def _start_exit(self, sym, t, why, cooldown=False, urgent=False):
+        """urgent (soft stop) + STOP_ORDER_TYPE=market -> close at market now;
+        otherwise a limit at the touch, turned into a market close after EXIT_CHASE_SECONDS."""
         notify(f"{sym} EXIT {NAME[t['side']]}: {why}")
-        t.update(phase=EXITING, exit_cooldown=cooldown)
+        t.update(phase=EXITING, exit_cooldown=cooldown, exit_started=self.clock())
         if t.get("tp_oid"):
             self.b.cancel(sym, t["tp_oid"])
             t["tp_oid"] = None
         pos, _ = self.b.positions().get(sym, (0, 0.0))
         if pos == 0:
             return self._on_closed(sym, t)
+        if urgent and C.STOP_ORDER_TYPE == "market":
+            return self._market_exit(sym, t, abs(pos))
         bid, ask = self.b.book(sym)
         self._repeg(sym, t, abs(pos), bid, ask)
+
+    def _market_exit(self, sym, t, qty):
+        for k in ("exit_oid", "stop_oid"):              # nothing else may close the same contracts
+            if t.get(k):
+                self.b.cancel(sym, t[k])
+                t[k] = None
+        t["stop_qty"] = None
+        try:
+            t["exit_mkt_oid"] = self.b.market(sym, "sell" if t["side"] == LONG else "buy", qty, reduce_only=True)
+        except Exception as e:
+            log.error("%s market exit failed, falling back to a limit at the touch: %s", sym, e)
+            t["exit_mkt_oid"] = None
+            bid, ask = self.b.book(sym)
+            self._repeg(sym, t, qty, bid, ask)
 
     def _repeg(self, sym, t, qty, bid, ask):
         """Keep a reduce-only post-only exit at the touch (inside the spread when it is wide)."""
@@ -452,7 +579,7 @@ class Bot:
             log.info("%s exit rejected (post-only), retry next poll: %s", sym, e)
 
     def _on_closed(self, sym, t):
-        for k in ("tp_oid", "exit_oid", "stop_oid"):
+        for k in ("tp_oid", "exit_oid", "stop_oid", "entry_oid"):
             if t.get(k):
                 self.b.cancel(sym, t[k])
         self.b.cancel_stops(sym)
@@ -463,8 +590,10 @@ class Bot:
             if pnl is None:              # history not available yet: estimate from last mid
                 cs = self.b.meta(sym)["cs"]
                 px = t.get("exit_px") or t.get("last_mid") or t["entry_price"]
+                fees = (C.TAKER_FEE if t.get("entry_market") else C.MAKER_FEE) \
+                    + (C.TAKER_FEE if t.get("exit_mkt_oid") else C.MAKER_FEE)
                 pnl = t["side"] * (px - t["entry_price"]) * t.get("max_qty", 0) * cs \
-                    - 2 * C.MAKER_FEE * t["entry_price"] * t.get("max_qty", 0) * cs
+                    - fees * t["entry_price"] * t.get("max_qty", 0) * cs
                 est = True
         d, tt = self.s["day"], self.s["total"]
         d["trades"] += 1; d["pnl"] += pnl
