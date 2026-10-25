@@ -3,6 +3,10 @@ import os
 
 import pandas as pd
 
+# candles of history Kronos reads per forecast (env LOOKBACK). Fewer = faster; the bot fetches 450 candles, so
+# values above 450 have no effect.
+LOOKBACK = max(32, min(int(os.getenv("LOOKBACK", "400")), 450))
+
 # model name -> (tokenizer, max_context)
 MODELS = {
     "mini": ("NeoQuasar/Kronos-Tokenizer-2k", 2048),
@@ -22,11 +26,12 @@ def load_predictor(name=None, device=None):
     return KronosPredictor(model, tokenizer, device=device, max_context=max_ctx)
 
 
-def expected_return(predictor, candles, pred_len=6, sample_count=3, lookback=400):
+def expected_return(predictor, candles, pred_len=6, sample_count=3, lookback=None):
     """Forecast `pred_len` future candles; return expected % move of the close.
 
     `candles` must contain only CLOSED candles, oldest -> newest.
     """
+    lookback = lookback or LOOKBACK
     x = candles.tail(lookback).reset_index(drop=True)
     step = x["timestamps"].diff().dropna().median()
     last_ts = x["timestamps"].iloc[-1]
@@ -40,7 +45,7 @@ def expected_return(predictor, candles, pred_len=6, sample_count=3, lookback=400
     return float(pred["close"].iloc[-1]) / last_close - 1.0
 
 
-def expected_returns(predictor, candles_by_sym, pred_len=6, sample_count=3, lookback=400, batch=None):
+def expected_returns(predictor, candles_by_sym, pred_len=6, sample_count=3, lookback=None, batch=None):
     """Forecast many coins at once with Kronos predict_batch -> {symbol: expected % move}.
 
     Same result as calling expected_return() per coin, but all coins share one model pass,
@@ -48,6 +53,7 @@ def expected_returns(predictor, candles_by_sym, pred_len=6, sample_count=3, look
     Coins are grouped by history length (predict_batch needs equal lengths).
     """
     batch = batch or int(os.getenv("FORECAST_BATCH", "1"))     # 1 = old memory use; raise on a bigger plan
+    lookback = lookback or LOOKBACK
     prepared = {}
     for sym, candles in candles_by_sym.items():
         x = candles.tail(lookback).reset_index(drop=True)
